@@ -174,7 +174,7 @@ function scheduleSessionTimers(booking) {
   smsMock.sendMockSms({
     to: phone,
     message:
-      "Your darshan session has started. Please exit within 2 minutes.",
+      "Your darshan session has started. You have 2 minutes inside — please scan exit before time runs out.",
     serial,
     phase: "entry_immediate",
   });
@@ -184,7 +184,8 @@ function scheduleSessionTimers(booking) {
     if (b && b.status === "active") {
       smsMock.sendMockSms({
         to: resolvePhoneForBooking(b),
-        message: "Warning: Your QR code will expire in 1 minute.",
+        message:
+          "Reminder: Your QR will become invalid within 1 minute. Please complete darshan and head to the exit gate to scan out.",
         serial,
         phase: "warning_1min",
       });
@@ -198,7 +199,8 @@ function scheduleSessionTimers(booking) {
       saveDb(db);
       smsMock.sendMockSms({
         to: resolvePhoneForBooking(b),
-        message: "Your QR code is now invalid.",
+        message:
+          "Your darshan window ended without an exit scan. You must pay a penalty fee of ₹100 at the counter. Please scan exit at the gate to record your visit.",
         serial,
         phase: "expired_2min",
       });
@@ -310,7 +312,7 @@ app.post("/api/monitor/crowd-alert", (req, res) => {
     if (!s.phone) return;
     smsMock.sendMockSms({
       to: s.phone,
-      message: `SOS: Overcrowding at ${z} — ${c} people detected on webcam. Please assist immediately.`,
+      message: `SOS ALERT: Crowd has exceeded the safe threshold at ${z} (~${c} people on webcam). Please attend immediately and assist with crowd control.`,
       serial: "",
       phase: "crowd_sos_staff",
     });
@@ -437,6 +439,10 @@ app.get("/api/slots", (req, res) => {
 app.post("/api/bookings", (req, res) => {
   const { visitor_name, people, date, phone, slot_time, is_walkin } =
     req.body || {};
+  const walkin = !!is_walkin;
+  if (!walkin && !currentUser(req)) {
+    return res.status(401).json({ error: "Please sign in to book a slot" });
+  }
   const ppl = parseInt(people, 10);
   if (!visitor_name || !date || !slot_time || !ppl || ppl < 1 || ppl > 4) {
     return res.status(400).json({ error: "Invalid booking data" });
@@ -503,6 +509,24 @@ app.get("/api/bookings/mine", (req, res) => {
       penalty: b.penalty,
     }));
   res.json({ bookings: rows });
+});
+
+/** Logged-in visitor: current in-temple session after gate ENTRY scan (for UI countdown). */
+app.get("/api/bookings/active-session", (req, res) => {
+  const user = currentUser(req);
+  if (!user) return res.status(401).json({ error: "Not logged in" });
+  const b = db.bookings.find(
+    (x) => x.user_id === user.id && x.status === "active"
+  );
+  if (!b || !b.expiryTime) return res.json({ active: null });
+  res.json({
+    active: {
+      serial: b.serial,
+      visitor_name: b.visitor_name,
+      entryTime: b.entryTime,
+      expiryTime: b.expiryTime,
+    },
+  });
 });
 
 app.get("/api/admin/bookings", requireAdmin, (req, res) => {
@@ -688,27 +712,31 @@ app.get("/api/admin/analytics", requireAdmin, (req, res) => {
   const dateStr =
     (req.query.date && String(req.query.date)) ||
     new Date().toISOString().split("T")[0];
-  const entries = Array(24).fill(0);
-  const exits = Array(24).fill(0);
+  const slotLabels = SLOT_DEFS.map((s) => s.time);
+  const slotIndex = Object.fromEntries(
+    slotLabels.map((t, i) => [t, i])
+  );
+  const entries = slotLabels.map(() => 0);
+  const exits = slotLabels.map(() => 0);
   db.bookings.forEach((b) => {
-    if (b.entryTime) {
-      const d = new Date(b.entryTime);
-      if (localDateKeyFromIso(b.entryTime) === dateStr) {
-        entries[d.getHours()] += b.people || 1;
-      }
+    const si = slotIndex[b.slot_time];
+    if (si === undefined) return;
+    if (b.entryTime && localDateKeyFromIso(b.entryTime) === dateStr) {
+      entries[si] += b.people || 1;
     }
-    if (b.exitTime) {
-      const d = new Date(b.exitTime);
-      if (localDateKeyFromIso(b.exitTime) === dateStr) {
-        exits[d.getHours()] += b.people || 1;
-      }
+    if (b.exitTime && localDateKeyFromIso(b.exitTime) === dateStr) {
+      exits[si] += b.people || 1;
     }
   });
-  const labels = Array.from({ length: 24 }, (_, i) =>
-    String(i).padStart(2, "0") + ":00"
-  );
   const max = Math.max(1, ...entries, ...exits);
-  res.json({ labels, entries, exits, max, date: dateStr });
+  res.json({
+    labels: slotLabels,
+    entries,
+    exits,
+    max,
+    date: dateStr,
+    granularity: "booking_slot",
+  });
 });
 
 app.use(express.static(path.join(__dirname, "public")));
